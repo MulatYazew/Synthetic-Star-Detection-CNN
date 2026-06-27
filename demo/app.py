@@ -1,12 +1,12 @@
 """
-Streamlit demo — Synthetic Star Detection CNN
-=============================================
+Streamlit demo — StarNet
+========================
 
 Launch:
     streamlit run demo/app.py
 """
 
-import os, sys
+import os, sys, random as _rng
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -18,12 +18,76 @@ sys.path.insert(0, ROOT)
 import streamlit as st
 import torch
 
+# ── Starfield background ──────────────────────────────────────────────────────
+def _inject_starfield() -> None:
+    r = _rng.Random(42)
+
+    def _shadows(n: int, color: str = "#fff") -> str:
+        return ", ".join(
+            f"{r.randint(0, 2560)}px {r.randint(0, 1440)}px {color}"
+            for _ in range(n)
+        )
+
+    small  = _shadows(700)
+    medium = _shadows(250)
+    large  = _shadows(80)
+
+    st.markdown(f"""
+<style>
+html, body {{
+    background: #0e1117 !important;
+    margin: 0; padding: 0;
+}}
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMainBlockContainer"],
+[data-testid="stMain"] {{
+    background: transparent !important;
+}}
+section[data-testid="stSidebar"] > div:first-child {{
+    background: rgba(14, 17, 23, 0.82) !important;
+    backdrop-filter: blur(6px);
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+}}
+.sf-nebula {{
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: -998;
+    pointer-events: none;
+    background:
+        radial-gradient(ellipse 60% 40% at 18% 28%, rgba(35, 20, 70, 0.55) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 55% at 78% 58%, rgba(10, 30, 60, 0.45) 0%, transparent 70%),
+        radial-gradient(ellipse 70% 30% at 50% 88%, rgba(25, 10, 45, 0.35) 0%, transparent 70%);
+}}
+.sf-star {{
+    position: fixed;
+    top: 0; left: 0;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: -999;
+}}
+#sf-s {{ width:1px; height:1px; box-shadow:{small};  animation:sf-tw1 3.5s ease-in-out infinite alternate; }}
+#sf-m {{ width:2px; height:2px; box-shadow:{medium}; animation:sf-tw2 5.5s ease-in-out infinite alternate; }}
+#sf-l {{ width:3px; height:3px; box-shadow:{large};  animation:sf-tw3 7.5s ease-in-out infinite alternate; }}
+@keyframes sf-tw1 {{ from{{opacity:.12}} to{{opacity:1.00}} }}
+@keyframes sf-tw2 {{ from{{opacity:.30}} to{{opacity:.90}} }}
+@keyframes sf-tw3 {{ from{{opacity:.08}} to{{opacity:.85}} }}
+</style>
+<div class="sf-nebula"></div>
+<div id="sf-s" class="sf-star"></div>
+<div id="sf-m" class="sf-star"></div>
+<div id="sf-l" class="sf-star"></div>
+""", unsafe_allow_html=True)
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Star Finder — CNN Demo",
+    page_title="StarNet",
     page_icon="⭐",
     layout="wide",
 )
+_inject_starfield()
 
 from codes.dataset       import generate_synthetic_field
 from codes.model import UNetStarFinder
@@ -46,11 +110,11 @@ def _load_model(path: str):
 def load_all_models():
     return {
         "Synthetic":        _load_model(
-            os.path.join(MODELS_DIR, "star_finder_synthetic.pt")),
+            os.path.join(MODELS_DIR, "synthetic_model.pt")),
         "Transfer-learned": _load_model(
-            os.path.join(MODELS_DIR, "star_finder_tl.pt")),
+            os.path.join(MODELS_DIR, "transfer_learning_model.pt")),
         "Scratch (real)":   _load_model(
-            os.path.join(MODELS_DIR, "star_finder_scratch.pt")),
+            os.path.join(MODELS_DIR, "real_scratch_model.pt")),
     }
 
 models    = load_all_models()
@@ -119,12 +183,7 @@ def predict_and_figure(image_2d: np.ndarray,
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.title("⭐ Star Finder CNN")
-st.sidebar.markdown(
-    "A U-Net trained to segment stars in astronomical images.  \n"
-    "*(Lectures 12 & 13 — Signal & Imaging Acquisition and Modelling)*"
-)
-st.sidebar.caption(f"Device: `{device}`  |  torch {torch.__version__}")
+st.sidebar.title("StarNet")
 
 if not available:
     st.sidebar.error(
@@ -349,17 +408,26 @@ Pixel labels: **1 = star** (within 3σ of the star centre), **0 = background**.
 
 ```
 codes/
+  config.py            ← centralized paths and hyperparameters
   dataset.py           ← synthetic generation + real data loading
   model.py             ← U-Net (MPS)
-  train.py             ← optimised training script
-  transfer_learning.py ← TL fine-tuning pipeline
+  losses.py            ← BCE, Dice, and BCE+Dice loss functions
+  train.py             ← multi-loss synthetic training script
+  transfer_learning.py ← multi-loss TL and scratch pipelines
   evaluate.py          ← metrics and visualisation helpers
 notebooks/
   synthetic_star_detection.ipynb  ← complete analysis notebook
 demo/
   app.py               ← this Streamlit app
-models/                ← saved model state-dicts (.pt)
-figures/               ← training curves and prediction plots
-star-dataset/          ← real FITS + labelled npy files
+models/
+  synthetic_model.pt          ← best U-Net trained on synthetic data
+  transfer_learning_model.pt  ← best transfer-learned model
+  real_scratch_model.pt       ← best model trained from scratch on real data
+results/
+  synthetic/           ← training curves, metrics, reports (synthetic pipeline)
+  transfer_learning/   ← TL history, comparison plots and reports
+  real/                ← scratch training history, comparison plots and reports
+  evaluation/          ← final evaluation outputs
+star-dataset/          ← real FITS + labelled npy files + generated synthetic data
 ```
 """)

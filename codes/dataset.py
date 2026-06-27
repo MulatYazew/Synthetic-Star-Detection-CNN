@@ -394,3 +394,88 @@ def generate_and_save_flat(
     print(f"  Labels   →  synthetic_labels.npy")
     print(f"  Metadata →  {csv_path.name}  {json_path.name}")
     return X, Y, records
+
+
+# --------------------------------------------------------------------------- #
+# Dataset preparation  (check-or-generate)
+# --------------------------------------------------------------------------- #
+
+def dataset_is_complete(dataset_root: "Path | str", n_samples: int) -> bool:
+    """Return True if a complete synthetic dataset of n_samples exists in dataset_root."""
+    root   = Path(dataset_root)
+    stars  = root / "synthetic_stars.npy"
+    labels = root / "synthetic_labels.npy"
+    meta   = root / "metadata" / "synthetic_metadata.json"
+    if not (stars.exists() and labels.exists() and meta.exists()):
+        return False
+    try:
+        arr = np.load(stars, mmap_mode="r")
+        return int(arr.shape[0]) == n_samples
+    except Exception:
+        return False
+
+
+def prepare_dataset(
+    dataset_root: "Path | str",
+    n_samples: int = 14_000,
+    image_size: int = 64,
+    min_stars: int = 1,
+    max_stars: int = 5,
+    fwhm_range: tuple = (8.0, 32.0),
+    snr_range: tuple = (2.0, 10_000.0),
+    seed: int = 42,
+    force_regenerate: bool = False,
+    save_png_previews: bool = True,
+    n_png_previews: int = 20,
+) -> tuple[np.ndarray, np.ndarray, list]:
+    """
+    Return (X, Y, records) for the full synthetic dataset.
+
+    Loads from disk when a complete dataset already exists and
+    force_regenerate is False.  Generates and saves a fresh dataset
+    otherwise.  Python, NumPy, and PyTorch random seeds are all fixed to
+    ``seed`` before generation so every new dataset is reproducible.
+    """
+    import random
+
+    dataset_root = Path(dataset_root)
+
+    if not force_regenerate and dataset_is_complete(dataset_root, n_samples):
+        print("Existing synthetic dataset found.")
+        print("Skipping dataset generation.")
+        print("Loading dataset for training...")
+        X = np.load(dataset_root / "synthetic_stars.npy")
+        Y = np.load(dataset_root / "synthetic_labels.npy")
+        with open(dataset_root / "metadata" / "synthetic_metadata.json") as fh:
+            records = json.load(fh)
+        return X, Y, records
+
+    if force_regenerate:
+        print("FORCE_REGENERATE=True — generating a fresh dataset.")
+    else:
+        print(f"No complete dataset found. Generating {n_samples:,} images ...")
+
+    # Fix all random seeds before generation for full reproducibility
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.backends.mps.is_available():
+            torch.mps.manual_seed(seed)
+    except ImportError:
+        pass
+
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    return generate_and_save_flat(
+        n_samples=n_samples,
+        dataset_root=dataset_root,
+        image_size=image_size,
+        min_stars=min_stars,
+        max_stars=max_stars,
+        fwhm_range=fwhm_range,
+        snr_range=snr_range,
+        seed=seed,
+        save_png_previews=save_png_previews,
+        n_png_previews=n_png_previews,
+    )

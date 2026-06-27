@@ -1,6 +1,11 @@
 """
 Training pipeline — Synthetic-Star U-Net on Apple M4 (MPS).
 
+Trains the U-Net with three loss functions (BCE, Dice, BCE+Dice), selects the
+best model by validation IoU, and saves it to models/synthetic_model.pt.
+Plots and CSVs → results/training/, checkpoints → results/checkpoints/,
+comparisons → results/performance_study/, reports → results/evaluation/.
+
 Usage (from project root):
     python codes/train.py
 
@@ -16,11 +21,7 @@ Key design choices
   - Batch size 64 for good MPS occupancy.
   - DataLoader num_workers=0: for in-memory arrays on macOS the "spawn"
     context adds ~0.5 s overhead per epoch; inline loading is faster.
-    Run --bench-workers to verify on your machine.
-  - Dataset disk cache: first run saves synthetic_dataset_cache.npz;
-    subsequent runs skip generation entirely.
-  - No autocast / mixed precision: MPS fp16/bf16 crashes with BCELoss
-    due to type mismatches in MPSGraph. Float32 is used throughout.
+  - No autocast / mixed precision: MPS fp16/bf16 crashes with BCELoss.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -47,38 +48,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     from codes.dataset import (generate_dataset, generate_and_save_flat,
-                                stratified_split_indices)
-    from codes.model import UNetStarFinder, bce_dice_loss, binary_iou
+                                stratified_split_indices, prepare_dataset)
+    from codes.model import UNetStarFinder, binary_iou
+    from codes.losses import get_loss
+    from codes.config import (
+        MODELS_DIR, DATASET_DIR,
+        TRAINING_RESULTS_DIR, CHECKPOINTS_DIR, PERFORMANCE_STUDY_DIR,
+        EVALUATION_RESULTS_DIR,
+        SYNTHETIC_MODEL_PATH, CACHE_PATH,
+        IMAGE_SIZE, N_TRAIN, N_VAL, BATCH_SIZE, BASE_FILTERS, EPOCHS, LR, SEED,
+        N_SAMPLES, FORCE_REGENERATE,
+        EARLY_STOP_PATIENCE, LR_REDUCE_PATIENCE, LR_REDUCE_FACTOR, LR_MIN,
+        LOSS_NAMES, LOSS_DISPLAY,
+    )
 except ImportError:
     from dataset import (generate_dataset, generate_and_save_flat,
-                         stratified_split_indices)
-    from model import UNetStarFinder, bce_dice_loss, binary_iou
-
-
-# ─────────────────────────────────────────────────────────────────── #
-# Configuration
-# ─────────────────────────────────────────────────────────────────── #
-
-MODELS_DIR   = ROOT / "models"
-FIGURES_DIR  = ROOT / "figures"
-RESULTS_DIR  = ROOT / "results"
-DATASET_DIR  = ROOT / "star-dataset"
-MODEL_PATH   = MODELS_DIR / "star_finder_synthetic.pt"
-CACHE_PATH   = DATASET_DIR / "synthetic_dataset_cache.npz"
-
-IMAGE_SIZE   = 64
-N_TRAIN      = 10_000
-N_VAL        = 2_000
-BATCH_SIZE   = 64        # 64 gives slightly better MPS occupancy than 32
-BASE_FILTERS = 32        # 7.8 M params; same quality as 64 on 64×64 images
-EPOCHS       = 50
-LR           = 1e-4
-SEED         = 42
-
-EARLY_STOP_PATIENCE = 12
-LR_REDUCE_PATIENCE  = 5
-LR_REDUCE_FACTOR    = 0.5
-LR_MIN              = 1e-6
+                         stratified_split_indices, prepare_dataset)
+    from model import UNetStarFinder, binary_iou
+    from losses import get_loss
+    from config import (
+        MODELS_DIR, DATASET_DIR,
+        TRAINING_RESULTS_DIR, CHECKPOINTS_DIR, PERFORMANCE_STUDY_DIR,
+        EVALUATION_RESULTS_DIR,
+        SYNTHETIC_MODEL_PATH, CACHE_PATH,
+        IMAGE_SIZE, N_TRAIN, N_VAL, BATCH_SIZE, BASE_FILTERS, EPOCHS, LR, SEED,
+        N_SAMPLES, FORCE_REGENERATE,
+        EARLY_STOP_PATIENCE, LR_REDUCE_PATIENCE, LR_REDUCE_FACTOR, LR_MIN,
+        LOSS_NAMES, LOSS_DISPLAY,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────── #
@@ -97,17 +94,22 @@ def get_device() -> torch.device:
 # ─────────────────────────────────────────────────────────────────── #
 
 def load_or_generate(n_train: int, n_val: int, image_size: int,
-                     cache: bool = True) -> tuple[np.ndarray, ...]:
+                     cache: bool = True,
+                     force_regenerate: bool = False) -> tuple[np.ndarray, ...]:
     """
     Return (X_train, Y_train, X_val, Y_val).
 
-    Priority:
-      1. Load from star-dataset/synthetic_dataset_cache.npz if shapes match.
-      2. Load from star-dataset/synthetic_stars.npy + synthetic_labels.npy
-         and apply stratified split by n_stars.
-      3. Generate the flat dataset from scratch, then split.
+    1. Load the stratified split from the .npz cache when shapes match
+       and force_regenerate is False (fastest path).
+    2. Load or generate the flat dataset via prepare_dataset(), then split.
+       prepare_dataset() reuses an existing dataset unless force_regenerate
+       is True, in which case it overwrites with a freshly seeded dataset.
     """
-    if cache and CACHE_PATH.exists():
+    if force_regenerate and CACHE_PATH.exists():
+        CACHE_PATH.unlink()
+        print("  Split cache cleared (force_regenerate=True).")
+
+    if cache and not force_regenerate and CACHE_PATH.exists():
         t0 = time.perf_counter()
         d = np.load(CACHE_PATH)
         if ("X_train" in d and "X_val" in d and
@@ -115,52 +117,32 @@ def load_or_generate(n_train: int, n_val: int, image_size: int,
                 d["X_val"].shape   == (n_val,   image_size, image_size, 1)):
             X_tr, Y_tr = d["X_train"], d["Y_train"]
             X_v,  Y_v  = d["X_val"],   d["Y_val"]
-            print(f"  Loaded dataset from cache in {time.perf_counter()-t0:.2f}s")
+            print(f"  Loaded split from cache in {time.perf_counter()-t0:.2f}s")
             return X_tr, Y_tr, X_v, Y_v
         print("  Cache shape mismatch — reloading from flat files …")
 
-    stars_path  = DATASET_DIR / "synthetic_stars.npy"
-    labels_path = DATASET_DIR / "synthetic_labels.npy"
-    meta_path   = DATASET_DIR / "metadata" / "synthetic_metadata.json"
-
-    if stars_path.exists() and labels_path.exists() and meta_path.exists():
-        t0 = time.perf_counter()
-        print("  Loading flat dataset from star-dataset/ …")
-        X_all = np.load(stars_path)
-        Y_all = np.load(labels_path)
-        with open(meta_path) as fh:
-            meta = json.load(fh)
-        n_stars_all = np.array([r["n_stars"] for r in meta])
-        n_test = len(X_all) - n_train - n_val
-        if n_test < 0:
-            n_test = 0
-        train_idx, val_idx, _ = stratified_split_indices(
-            n_stars_all, n_train, n_val, n_test, seed=SEED)
-        X_tr, Y_tr = X_all[train_idx], Y_all[train_idx]
-        X_v,  Y_v  = X_all[val_idx],   Y_all[val_idx]
-        print(f"  Stratified split done in {time.perf_counter()-t0:.2f}s")
-    else:
-        n_total = n_train + n_val + 2_000
-        print(f"  Generating {n_total:,} synthetic images …")
-        t0 = time.perf_counter()
-        DATASET_DIR.mkdir(parents=True, exist_ok=True)
-        X_all, Y_all, meta = generate_and_save_flat(
-            n_samples=n_total, dataset_root=DATASET_DIR,
-            image_size=image_size, seed=SEED)
-        n_stars_all = np.array([r["n_stars"] for r in meta])
-        n_test = n_total - n_train - n_val
-        train_idx, val_idx, _ = stratified_split_indices(
-            n_stars_all, n_train, n_val, n_test, seed=SEED)
-        X_tr, Y_tr = X_all[train_idx], Y_all[train_idx]
-        X_v,  Y_v  = X_all[val_idx],   Y_all[val_idx]
-        print(f"  Generated + split in {time.perf_counter()-t0:.2f}s")
+    t0 = time.perf_counter()
+    X_all, Y_all, meta = prepare_dataset(
+        dataset_root=DATASET_DIR,
+        n_samples=N_SAMPLES,
+        image_size=image_size,
+        seed=SEED,
+        force_regenerate=force_regenerate,
+    )
+    n_stars_all = np.array([r["n_stars"] for r in meta])
+    n_test = max(0, len(X_all) - n_train - n_val)
+    train_idx, val_idx, _ = stratified_split_indices(
+        n_stars_all, n_train, n_val, n_test, seed=SEED)
+    X_tr, Y_tr = X_all[train_idx], Y_all[train_idx]
+    X_v,  Y_v  = X_all[val_idx],   Y_all[val_idx]
+    print(f"  Stratified split in {time.perf_counter()-t0:.2f}s")
 
     if cache:
         DATASET_DIR.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(CACHE_PATH,
                             X_train=X_tr, Y_train=Y_tr,
                             X_val=X_v,    Y_val=Y_v)
-        print(f"  Dataset cached → {CACHE_PATH}")
+        print(f"  Split cached → {CACHE_PATH}")
 
     return X_tr, Y_tr, X_v, Y_v
 
@@ -168,8 +150,7 @@ def load_or_generate(n_train: int, n_val: int, image_size: int,
 def make_loader(X: np.ndarray, Y: np.ndarray,
                 batch_size: int,
                 shuffle: bool,
-                num_workers: int = 0,
-                device: torch.device = None) -> DataLoader:
+                num_workers: int = 0) -> DataLoader:
     """
     Build a DataLoader from NumPy arrays.
 
@@ -179,7 +160,6 @@ def make_loader(X: np.ndarray, Y: np.ndarray,
     the "spawn" multiprocessing start method adds ~0.5 s overhead per epoch.
     Run --bench-workers to verify the optimal value on your machine.
     """
-    # Move to float32 tensors on CPU; transfer to device happens inside the loop
     xt = torch.from_numpy(X).permute(0, 3, 1, 2).contiguous()  # NHWC → NCHW
     yt = torch.from_numpy(Y).permute(0, 3, 1, 2).contiguous()
     dataset = TensorDataset(xt, yt)
@@ -208,8 +188,7 @@ def bench_num_workers(X: np.ndarray, Y: np.ndarray,
     for nw in [0, 2, 4, 6, 8]:
         loader = make_loader(X, Y, batch_size=batch_size,
                              shuffle=False, num_workers=nw)
-        # One warmup pass to amortise worker startup cost
-        for _ in loader:
+        for _ in loader:   # warmup pass
             pass
         t0 = time.perf_counter()
         n_batches = 0
@@ -223,23 +202,23 @@ def bench_num_workers(X: np.ndarray, Y: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────── #
-# Training loop
+# Training helpers
 # ─────────────────────────────────────────────────────────────────── #
 
 class EarlyStopper:
     def __init__(self, patience: int, mode: str = "max"):
-        self.patience = patience
-        self.mode     = mode
-        self.best     = -float("inf") if mode == "max" else float("inf")
-        self.counter  = 0
+        self.patience   = patience
+        self.mode       = mode
+        self.best       = -float("inf") if mode == "max" else float("inf")
+        self.counter    = 0
         self.best_epoch = 0
 
     def step(self, value: float, epoch: int) -> bool:
         """Return True when training should stop."""
         improved = (value > self.best) if self.mode == "max" else (value < self.best)
         if improved:
-            self.best = value
-            self.counter = 0
+            self.best       = value
+            self.counter    = 0
             self.best_epoch = epoch
         else:
             self.counter += 1
@@ -250,16 +229,16 @@ class ReduceLROnPlateau:
     def __init__(self, optimizer: torch.optim.Optimizer,
                  factor: float = 0.5, patience: int = 5,
                  min_lr: float = 1e-6):
-        self.opt     = optimizer
-        self.factor  = factor
+        self.opt      = optimizer
+        self.factor   = factor
         self.patience = patience
-        self.min_lr  = min_lr
-        self.best    = float("inf")
-        self.counter = 0
+        self.min_lr   = min_lr
+        self.best     = float("inf")
+        self.counter  = 0
 
     def step(self, val_loss: float) -> None:
         if val_loss < self.best:
-            self.best = val_loss
+            self.best    = val_loss
             self.counter = 0
         else:
             self.counter += 1
@@ -273,10 +252,12 @@ def run_epoch(model: nn.Module,
               loader: DataLoader,
               optimizer: torch.optim.Optimizer | None,
               device: torch.device,
-              profile: bool = False
-              ) -> tuple[float, float, dict]:
+              loss_fn,
+              profile: bool = False) -> tuple[float, float, dict]:
     """
     Run one training or validation epoch.
+
+    loss_fn signature: loss_fn(y_true, y_pred) → scalar tensor.
     Returns (mean_loss, mean_iou, timing_dict).
     timing_dict keys: data_s, forward_s, backward_s, optim_s
     """
@@ -300,20 +281,18 @@ def run_epoch(model: nn.Module,
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
 
-        # ── Forward ────────────────────────────────────────────────── #
         t_fwd = time.perf_counter()
         pred  = model(xb)
-        loss  = bce_dice_loss(pred, yb)
+        loss  = loss_fn(yb, pred)   # (y_true, y_pred) convention from losses.py
 
         if profile:
             if device.type == "mps":
                 torch.mps.synchronize()
             timing["forward_s"] += time.perf_counter() - t_fwd
 
-        # ── Backward ───────────────────────────────────────────────── #
         if is_train:
             t_bwd = time.perf_counter()
-            optimizer.zero_grad(set_to_none=True)   # set_to_none saves a memset
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
             if profile:
@@ -321,7 +300,6 @@ def run_epoch(model: nn.Module,
                     torch.mps.synchronize()
                 timing["backward_s"] += time.perf_counter() - t_bwd
 
-            # ── Optimizer step ─────────────────────────────────────── #
             t_opt = time.perf_counter()
             optimizer.step()
 
@@ -336,7 +314,6 @@ def run_epoch(model: nn.Module,
         total_loss += loss.item()
         total_iou  += iou.item()
         n_batches  += 1
-
         t_data_start = time.perf_counter()
 
     return total_loss / n_batches, total_iou / n_batches, timing
@@ -356,90 +333,62 @@ def _save_training_csv(history: dict, path: Path) -> None:
     print(f"  Training metrics → {path}")
 
 
-def train_synthetic(
-    n_train:      int   = N_TRAIN,
-    n_val:        int   = N_VAL,
-    image_size:   int   = IMAGE_SIZE,
-    batch_size:   int   = BATCH_SIZE,
-    epochs:       int   = EPOCHS,
-    base_filters: int   = BASE_FILTERS,
-    lr:           float = LR,
-    model_path:   Path  = MODEL_PATH,
-    num_workers:  int   = 0,
-    use_cache:    bool  = True,
-    verbose:      bool  = True,
-) -> dict:
+# ─────────────────────────────────────────────────────────────────── #
+# Single-loss training run
+# ─────────────────────────────────────────────────────────────────── #
+
+def train_one_loss(
+    loss_name:       str,
+    train_loader:    DataLoader,
+    val_loader:      DataLoader,
+    device:          torch.device,
+    n_train:         int,
+    n_val:           int,
+    base_filters:    int   = BASE_FILTERS,
+    epochs:          int   = EPOCHS,
+    lr:              float = LR,
+    checkpoint_path: Path  = None,
+    verbose:         bool  = True,
+) -> tuple[dict, float]:
     """
-    Full training pipeline.  Returns history dict with keys:
-    train_loss, train_iou, val_loss, val_iou, epoch_time_s.
+    Train a fresh U-Net for one loss function.
+
+    Returns (history_dict, best_val_iou).
+    If checkpoint_path is given, the best model state is saved there.
     """
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-    for sub in ("metrics", "predictions", "star_catalogs",
-                "transfer_learning", "real_data_results", "performance_study"):
-        (RESULTS_DIR / sub).mkdir(parents=True, exist_ok=True)
+    loss_fn = get_loss(loss_name)
+    label   = LOSS_DISPLAY.get(loss_name, loss_name)
 
-    device = get_device()
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"  Device      : {device}")
-        print(f"  Base filters: {base_filters}")
-        print(f"  Batch size  : {batch_size}")
-        print(f"  Epochs      : {epochs}")
-        print(f"{'='*60}\n")
-
-    # ── Dataset ────────────────────────────────────────────────────── #
-    if verbose:
-        print("[1/4] Dataset")
-    X_tr, Y_tr, X_v, Y_v = load_or_generate(n_train, n_val, image_size, use_cache)
-    if verbose:
-        print(f"  X_train: {X_tr.shape}  Y_train: {Y_tr.shape}")
-        print(f"  X_val  : {X_v.shape}   Y_val  : {Y_v.shape}")
-        print(f"  Star pixel fraction (train): {Y_tr.mean():.4f}\n")
-
-    train_loader = make_loader(X_tr, Y_tr, batch_size, shuffle=True,  num_workers=num_workers)
-    val_loader   = make_loader(X_v,  Y_v,  batch_size, shuffle=False, num_workers=num_workers)
-
-    # ── Model ──────────────────────────────────────────────────────── #
-    if verbose:
-        print("[2/4] Model")
-    model = UNetStarFinder(base_filters=base_filters, dropout=0.2).to(device)
-    if verbose:
-        print(f"  Parameters  : {model.param_count()/1e6:.2f} M")
-        print(f"  Architecture: U-Net  1→{base_filters}→{base_filters*2}→"
-              f"{base_filters*4}→{base_filters*8}→{base_filters*16} (bottleneck)\n")
-
-    # L2 regularisation via weight_decay in the optimizer (AdamW-style)
+    model     = UNetStarFinder(base_filters=base_filters, dropout=0.2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-
-    lr_scheduler = ReduceLROnPlateau(optimizer, factor=LR_REDUCE_FACTOR,
-                                     patience=LR_REDUCE_PATIENCE, min_lr=LR_MIN)
-    early_stopper = EarlyStopper(patience=EARLY_STOP_PATIENCE, mode="max")
-
-    # ── Training loop ─────────────────────────────────────────────── #
-    if verbose:
-        print("[3/4] Training")
+    lr_sched  = ReduceLROnPlateau(optimizer, factor=LR_REDUCE_FACTOR,
+                                   patience=LR_REDUCE_PATIENCE, min_lr=LR_MIN)
+    stopper   = EarlyStopper(patience=EARLY_STOP_PATIENCE, mode="max")
 
     history: dict[str, list] = {
         "train_loss": [], "train_iou": [],
         "val_loss":   [], "val_iou":   [],
         "epoch_time_s": [],
     }
-    best_val_iou  = -float("inf")
-    best_state    = None
+    best_val_iou = -float("inf")
+    best_state   = None
 
-    epoch_bar = tqdm(range(1, epochs + 1), desc="Training",
+    if verbose:
+        print(f"\n{'─'*60}")
+        print(f"  Loss: {label:<14} | params: {model.param_count()/1e6:.2f} M "
+              f"| device: {device}")
+        print(f"{'─'*60}")
+
+    epoch_bar = tqdm(range(1, epochs + 1), desc=f"[{label}]",
                      unit="epoch", disable=not verbose)
     for epoch in epoch_bar:
         t_epoch = time.perf_counter()
-
-        # Profile first epoch to show breakdown; subsequent epochs fast path
         profile = (epoch == 1)
 
         tr_loss, tr_iou, tr_timing = run_epoch(
-            model, train_loader, optimizer, device, profile=profile)
-        val_loss, val_iou, val_timing = run_epoch(
-            model, val_loader, None, device, profile=profile)
+            model, train_loader, optimizer, device, loss_fn, profile=profile)
+        val_loss, val_iou, _ = run_epoch(
+            model, val_loader, None, device, loss_fn)
 
         epoch_s = time.perf_counter() - t_epoch
         lr_now  = optimizer.param_groups[0]["lr"]
@@ -454,86 +403,255 @@ def train_synthetic(
             loss=f"{tr_loss:.4f}", iou=f"{tr_iou:.4f}",
             val_iou=f"{val_iou:.4f}", lr=f"{lr_now:.2e}")
 
-        # Checkpoint
         if val_iou > best_val_iou:
             best_val_iou = val_iou
             best_state   = {k: v.cpu().clone()
                             for k, v in model.state_dict().items()}
-            torch.save(best_state, model_path)
+            if checkpoint_path is not None:
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(best_state, checkpoint_path)
 
-        lr_scheduler.step(val_loss)
+        lr_sched.step(val_loss)
 
         if verbose:
             throughput = (n_train + n_val) / epoch_s
-            remaining  = (epochs - epoch) * epoch_s
             tqdm.write(
-                f"Epoch {epoch:3d}/{epochs}  "
+                f"  [{label}] Ep {epoch:3d}/{epochs}  "
                 f"loss {tr_loss:.4f}  iou {tr_iou:.4f}  "
                 f"val_loss {val_loss:.4f}  val_iou {val_iou:.4f}  "
-                f"lr {lr_now:.2e}  "
-                f"{epoch_s:.1f}s  ({throughput:.0f} samp/s)  "
-                f"ETA {remaining/60:.1f}min"
+                f"lr {lr_now:.2e}  {epoch_s:.1f}s  ({throughput:.0f} samp/s)"
             )
             if profile:
                 t = tr_timing
                 tqdm.write(
-                    f"  Profiling (train epoch):  "
+                    f"    Profile:  "
                     f"data {t['data_s']:.3f}s  "
                     f"fwd {t['forward_s']:.3f}s  "
                     f"bwd {t['backward_s']:.3f}s  "
                     f"opt {t['optim_s']:.3f}s"
                 )
 
-        if early_stopper.step(val_iou, epoch):
+        if stopper.step(val_iou, epoch):
             if verbose:
-                tqdm.write(f"\nEarly stop at epoch {epoch}. "
+                tqdm.write(f"  [{label}] Early stop at epoch {epoch}. "
                            f"Best val IoU = {best_val_iou:.4f} "
-                           f"(epoch {early_stopper.best_epoch})")
+                           f"(epoch {stopper.best_epoch})")
             break
 
-    # Restore best weights
-    if best_state is not None:
-        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-
-    _save_training_csv(history, RESULTS_DIR / "metrics" / "training_metrics.csv")
-
     if verbose:
-        mean_t   = np.mean(history["epoch_time_s"])
-        print(f"\n[4/4] Done")
-        print(f"  Best val IoU : {best_val_iou:.4f}")
-        print(f"  Model saved  : {model_path}")
-        print(f"  Mean epoch   : {mean_t:.1f}s  "
-              f"({(n_train+n_val)/mean_t:.0f} samp/s avg)")
+        print(f"  [{label}] ✓ Best val IoU: {best_val_iou:.4f}")
 
-    plot_history(history, FIGURES_DIR)
-    return history
+    return history, best_val_iou
 
 
 # ─────────────────────────────────────────────────────────────────── #
-# Plotting
+# Plotting helpers
 # ─────────────────────────────────────────────────────────────────── #
 
-def plot_history(hist: dict, figures_dir: Path) -> None:
+def plot_history(hist: dict, loss_name: str, save_dir: Path) -> None:
+    """Save individual training/validation history plot for one loss function."""
+    label = LOSS_DISPLAY.get(loss_name, loss_name)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     axes[0].plot(hist["train_loss"], label="train")
     axes[0].plot(hist["val_loss"],   label="validation")
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
-    axes[0].set_title("Training loss (BCE+Dice hybrid)")
+    axes[0].set_title(f"Loss — {label}")
     axes[0].legend()
 
     axes[1].plot(hist["train_iou"], label="train")
     axes[1].plot(hist["val_iou"],   label="validation")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("IoU")
-    axes[1].set_title("Intersection over Union")
+    axes[1].set_title(f"IoU — {label}")
     axes[1].legend()
 
-    plt.suptitle("Synthetic U-Net (MPS) — training history", fontsize=12)
+    plt.suptitle(f"Synthetic U-Net ({label}) — training history", fontsize=12)
     plt.tight_layout()
-    out = figures_dir / "training_history.png"
+    out = save_dir / f"{loss_name}_training_history.png"
     plt.savefig(out, dpi=150)
     plt.close()
-    print(f"  Training curves → {out}")
+    print(f"  History plot → {out}")
+
+
+def plot_loss_comparison(all_histories: dict[str, dict], save_dir: Path) -> None:
+    """Save a comparison plot of validation IoU and validation loss for all 3 losses."""
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    for loss_name, hist in all_histories.items():
+        label = LOSS_DISPLAY.get(loss_name, loss_name)
+        axes[0].plot(hist["val_iou"],  label=label)
+        axes[1].plot(hist["val_loss"], label=label)
+
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Validation IoU")
+    axes[0].set_title("Validation IoU — loss function comparison")
+    axes[0].legend()
+
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Validation Loss")
+    axes[1].set_title("Validation Loss — loss function comparison")
+    axes[1].legend()
+
+    plt.suptitle("Synthetic Pipeline — Loss Function Comparison", fontsize=12)
+    plt.tight_layout()
+    out = save_dir / "loss_comparison.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"  Comparison plot → {out}")
+
+
+def save_comparison_report(
+    results_per_loss: dict[str, tuple],
+    save_dir: Path,
+    best_loss_name: str,
+    model_save_path: Path,
+) -> None:
+    """Save CSV table and text summary of the loss function comparison."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = save_dir / "loss_comparison.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["loss_fn", "display_name", "best_val_iou", "epochs_trained"])
+        for loss_name, (hist, best_iou) in results_per_loss.items():
+            writer.writerow([
+                loss_name,
+                LOSS_DISPLAY.get(loss_name, loss_name),
+                round(best_iou, 6),
+                len(hist["val_iou"]),
+            ])
+    print(f"  Comparison CSV → {csv_path}")
+
+    txt_path = save_dir / "best_model_report.txt"
+    lines = [
+        "=== Synthetic Pipeline — Loss Function Comparison ===",
+        "",
+        f"{'Loss Function':<22}{'Best Val IoU':>14}{'Epochs':>10}",
+        "─" * 46,
+    ]
+    for loss_name, (hist, best_iou) in results_per_loss.items():
+        label  = LOSS_DISPLAY.get(loss_name, loss_name)
+        marker = "  ← SELECTED" if loss_name == best_loss_name else ""
+        lines.append(
+            f"{label:<22}{best_iou:>14.4f}{len(hist['val_iou']):>10}{marker}"
+        )
+    best_iou_val = results_per_loss[best_loss_name][1]
+    lines += [
+        "─" * 46,
+        "",
+        f"Best loss function : {LOSS_DISPLAY.get(best_loss_name, best_loss_name)}",
+        f"Best val IoU       : {best_iou_val:.4f}",
+        f"Model saved to     : {model_save_path}",
+    ]
+    txt_path.write_text("\n".join(lines))
+
+    print(f"  Report → {txt_path}")
+    print()
+    print("\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────────── #
+# Main training orchestrator
+# ─────────────────────────────────────────────────────────────────── #
+
+def train_synthetic(
+    n_train:          int   = N_TRAIN,
+    n_val:            int   = N_VAL,
+    image_size:       int   = IMAGE_SIZE,
+    batch_size:       int   = BATCH_SIZE,
+    epochs:           int   = EPOCHS,
+    base_filters:     int   = BASE_FILTERS,
+    lr:               float = LR,
+    model_path:       Path  = SYNTHETIC_MODEL_PATH,
+    num_workers:      int   = 0,
+    use_cache:        bool  = True,
+    loss_names:       list  = None,
+    verbose:          bool  = True,
+    force_regenerate: bool  = FORCE_REGENERATE,
+) -> dict:
+    """
+    Train U-Net on synthetic data for each loss function, select the best
+    by validation IoU, and save it to model_path.
+
+    Returns dict mapping loss_name → (history, best_val_iou).
+    Plots/CSVs → results/training/, checkpoints → results/checkpoints/,
+    comparisons → results/performance_study/, reports → results/evaluation/.
+    """
+    if loss_names is None:
+        loss_names = LOSS_NAMES
+
+    for d in [MODELS_DIR, TRAINING_RESULTS_DIR, CHECKPOINTS_DIR,
+              PERFORMANCE_STUDY_DIR, EVALUATION_RESULTS_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    device = get_device()
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"  Device      : {device}")
+        print(f"  Base filters: {base_filters}")
+        print(f"  Batch size  : {batch_size}")
+        print(f"  Epochs      : {epochs}")
+        print(f"  Loss fns    : {loss_names}")
+        print(f"  Training    : {TRAINING_RESULTS_DIR}")
+        print(f"  Checkpoints : {CHECKPOINTS_DIR}")
+        print(f"  Perf. study : {PERFORMANCE_STUDY_DIR}")
+        print(f"  Evaluation  : {EVALUATION_RESULTS_DIR}")
+        print(f"{'='*60}\n")
+
+    # ── Dataset ──────────────────────────────────────────────────── #
+    if verbose:
+        print("[1/3] Dataset")
+    X_tr, Y_tr, X_v, Y_v = load_or_generate(
+        n_train, n_val, image_size, use_cache, force_regenerate)
+    if verbose:
+        print(f"  X_train: {X_tr.shape}  Y_train: {Y_tr.shape}")
+        print(f"  X_val  : {X_v.shape}   Y_val  : {Y_v.shape}")
+        print(f"  Star pixel fraction (train): {Y_tr.mean():.4f}")
+
+    train_loader = make_loader(X_tr, Y_tr, batch_size, shuffle=True,
+                               num_workers=num_workers)
+    val_loader   = make_loader(X_v,  Y_v,  batch_size, shuffle=False,
+                               num_workers=num_workers)
+
+    # ── Multi-loss training ──────────────────────────────────────── #
+    if verbose:
+        print(f"\n[2/3] Training {len(loss_names)} model(s)")
+
+    results: dict[str, tuple] = {}
+    for loss_name in loss_names:
+        checkpoint = CHECKPOINTS_DIR / f"{loss_name}_best.pt"
+        hist, best_iou = train_one_loss(
+            loss_name       = loss_name,
+            train_loader    = train_loader,
+            val_loader      = val_loader,
+            device          = device,
+            n_train         = n_train,
+            n_val           = n_val,
+            base_filters    = base_filters,
+            epochs          = epochs,
+            lr              = lr,
+            checkpoint_path = checkpoint,
+            verbose         = verbose,
+        )
+        results[loss_name] = (hist, best_iou)
+        _save_training_csv(hist,
+                           TRAINING_RESULTS_DIR / f"{loss_name}_training.csv")
+        plot_history(hist, loss_name, TRAINING_RESULTS_DIR)
+
+    # ── Best model selection ─────────────────────────────────────── #
+    best_loss = max(results, key=lambda k: results[k][1])
+
+    if verbose:
+        print(f"\n[3/3] Results")
+
+    src = CHECKPOINTS_DIR / f"{best_loss}_best.pt"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, model_path)
+    print(f"  Best model ({LOSS_DISPLAY.get(best_loss, best_loss)}) saved → {model_path}")
+
+    all_histories = {k: v[0] for k, v in results.items()}
+    plot_loss_comparison(all_histories, PERFORMANCE_STUDY_DIR)
+    save_comparison_report(results, EVALUATION_RESULTS_DIR, best_loss, model_path)
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────── #
@@ -542,7 +660,7 @@ def plot_history(hist: dict, figures_dir: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Optimised training for synthetic star U-Net")
+        description="Synthetic star U-Net — multi-loss training pipeline")
     p.add_argument("--bench-workers", action="store_true",
                    help="Benchmark num_workers values (0,2,4,6,8) then exit")
     p.add_argument("--full-model", action="store_true",
@@ -550,8 +668,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     p.add_argument("--epochs",     type=int, default=EPOCHS)
     p.add_argument("--lr",         type=float, default=LR)
-    p.add_argument("--no-cache",   action="store_true",
-                   help="Force dataset regeneration (ignore disk cache)")
+    p.add_argument("--no-cache",    action="store_true",
+                   help="Ignore the split cache (re-split from flat files each run)")
+    p.add_argument("--force-regen", action="store_true",
+                   help="Overwrite existing dataset and generate a fresh one "
+                        "(overrides FORCE_REGENERATE in config.py)")
+    p.add_argument("--loss", nargs="+", default=None,
+                   choices=LOSS_NAMES,
+                   help="Loss functions to train (default: all three)")
     return p.parse_args()
 
 
@@ -565,9 +689,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     train_synthetic(
-        batch_size   = args.batch_size,
-        epochs       = args.epochs,
-        base_filters = 64 if args.full_model else BASE_FILTERS,
-        lr           = args.lr,
-        use_cache    = not args.no_cache,
+        batch_size        = args.batch_size,
+        epochs            = args.epochs,
+        base_filters      = 64 if args.full_model else BASE_FILTERS,
+        lr                = args.lr,
+        use_cache         = not args.no_cache,
+        loss_names        = args.loss,
+        force_regenerate  = args.force_regen,
     )
