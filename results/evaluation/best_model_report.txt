@@ -1,0 +1,12 @@
+=== Synthetic Pipeline — Loss Function Comparison ===
+
+Loss Function           Best Val IoU    Epochs
+──────────────────────────────────────────────
+BCE                           0.6589        29
+Dice                          0.9554        16  ← SELECTED
+BCE + Dice                    0.6618        14
+──────────────────────────────────────────────
+
+Best loss function : Dice
+Best val IoU       : 0.9554
+Model saved to     : /Users/mulatyazewchekol/Documents/My_Projects/Final_Projects/Synthetic-Star-Detection-CNN/models/star_finder_synthetic.pt

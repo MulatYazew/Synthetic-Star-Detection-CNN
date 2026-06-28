@@ -1,0 +1,4 @@
+loss_fn,display_name,best_val_iou,epochs_trained
+bce,BCE,0.658886,29
+dice,Dice,0.955438,16
+bce_dice,BCE + Dice,0.661768,14
