@@ -1,0 +1,9 @@
+numpy
+matplotlib
+scipy
+scikit-image
+torch
+streamlit
+tqdm
+astropy
+Pillow
