@@ -110,11 +110,11 @@ def _load_model(path: str):
 def load_all_models():
     return {
         "Synthetic":        _load_model(
-            os.path.join(MODELS_DIR, "synthetic_model.pt")),
+            os.path.join(MODELS_DIR, "star_finder_synthetic.pt")),
         "Transfer-learned": _load_model(
-            os.path.join(MODELS_DIR, "transfer_learning_model.pt")),
+            os.path.join(MODELS_DIR, "star_finder_tl.pt")),
         "Scratch (real)":   _load_model(
-            os.path.join(MODELS_DIR, "real_scratch_model.pt")),
+            os.path.join(MODELS_DIR, "star_finder_scratch.pt")),
     }
 
 models    = load_all_models()
