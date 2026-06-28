@@ -362,8 +362,37 @@ with tab_about:
     st.markdown("""
 ### Photometry AI: Identification of Stars in an Image
 
-**Course:** Signal and Imaging Acquisition and Modelling in Environment
-**Lectures 12 & 13** — Federico De Guio · Alejandro Benitez-Llambay
+---
+
+#### About this Application
+
+This interactive demo showcases a deep learning framework for astronomical star detection using a U-Net semantic segmentation model.
+
+**Features**
+- Generate predictions on astronomical FITS images.
+- Compare synthetic pre-trained, transfer learning, and real-data models.
+- Visualize predicted segmentation masks.
+- Detect individual stars using connected component analysis.
+- Display detected star centroids and counts.
+- Adjust prediction threshold interactively.
+- View quantitative evaluation metrics and inference results.
+
+**Models**
+
+The application includes three trained models:
+- **Synthetic Model** – Trained exclusively on 14,000 synthetic star images.
+- **Transfer Learning Model** – Fine-tuned on real astronomical observations after synthetic pretraining.
+- **Real Scratch Model** – Trained only on the real labelled dataset.
+
+**Workflow**
+
+1. Upload a FITS image.
+2. Select the trained model.
+3. Perform semantic segmentation.
+4. Apply thresholding and connected-component analysis.
+5. Visualize detected stars and quantitative results.
+
+This application demonstrates the complete inference pipeline developed for the project and provides an intuitive interface for evaluating model performance on astronomical images.
 
 ---
 
@@ -401,33 +430,4 @@ Fully convolutional — trained on 64×64 patches, applies to any image divisibl
 $$\\text{IoU} = \\frac{\\text{TP}}{\\text{TP} + \\text{FP} + \\text{FN}}$$
 
 Pixel labels: **1 = star** (within 3σ of the star centre), **0 = background**.
-
----
-
-#### File layout
-
-```
-codes/
-  config.py            ← centralized paths and hyperparameters
-  dataset.py           ← synthetic generation + real data loading
-  model.py             ← U-Net (MPS)
-  losses.py            ← BCE, Dice, and BCE+Dice loss functions
-  train.py             ← multi-loss synthetic training script
-  transfer_learning.py ← multi-loss TL and scratch pipelines
-  evaluate.py          ← metrics and visualisation helpers
-notebooks/
-  synthetic_star_detection.ipynb  ← complete analysis notebook
-demo/
-  app.py               ← this Streamlit app
-models/
-  synthetic_model.pt          ← best U-Net trained on synthetic data
-  transfer_learning_model.pt  ← best transfer-learned model
-  real_scratch_model.pt       ← best model trained from scratch on real data
-results/
-  synthetic/           ← training curves, metrics, reports (synthetic pipeline)
-  transfer_learning/   ← TL history, comparison plots and reports
-  real/                ← scratch training history, comparison plots and reports
-  evaluation/          ← final evaluation outputs
-star-dataset/          ← real FITS + labelled npy files + generated synthetic data
-```
 """)
