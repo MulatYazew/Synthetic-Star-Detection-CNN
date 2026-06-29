@@ -273,13 +273,13 @@ with tab_syn:
 with tab_real:
     st.header("Upload a real astronomical image")
     st.markdown(
-        "Supported formats: **PNG / TIFF / NPY / FITS** (`.fits`, `.fits.fz`).  \n"
+        "Supported formats: **JPG / PNG / TIFF / NPY / FITS** (`.fits`, `.fits.fz`).  \n"
         "For FITS files the app reads the first science extension."
     )
 
     uploaded = st.file_uploader(
         "Choose an image file",
-        type=["png", "tif", "tiff", "npy", "fits", "fz"],
+        type=["jpg", "jpeg", "png", "tif", "tiff", "npy", "fits", "fz"],
     )
 
     if uploaded is not None:
