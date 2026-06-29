@@ -396,25 +396,6 @@ This application demonstrates the complete inference pipeline developed for the 
 
 ---
 
-#### Architecture: U-Net (Fully Convolutional Network)
-
-```
-Input (H × W × 1)
-  ↓
-Encoder: 4× [Conv3×3 → BN → ReLU] × 2  +  MaxPool2×2
-  Filters: 64 → 128 → 256 → 512
-  ↓
-Bottleneck: [Conv3×3 → BN → ReLU] × 2  (1024 filters)
-  ↓
-Decoder: 4× ConvTranspose(2×2) → Concat(skip) → [Conv3×3 → BN → ReLU] × 2
-  ↓
-Output: Conv1×1 → Sigmoid
-```
-
-Fully convolutional — trained on 64×64 patches, applies to any image divisible by 16.
-
----
-
 #### Training strategy
 
 | Model | Training data | Notes |
