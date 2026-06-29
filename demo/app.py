@@ -143,9 +143,9 @@ def predict_and_figure(image_2d: np.ndarray,
                        selected_models: dict,
                        threshold: float) -> plt.Figure:
     """Build a summary figure for one image across multiple models."""
-    n_models = len(selected_models)
-    ncols    = 2 + n_models
+    n_models  = len(selected_models)
     has_truth = true_mask_2d is not None
+    ncols     = (2 if has_truth else 1) + n_models
 
     fig, axes = plt.subplots(1, ncols, figsize=(4.5 * ncols, 4.5),
                              constrained_layout=True)
