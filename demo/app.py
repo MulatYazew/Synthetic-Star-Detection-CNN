@@ -147,19 +147,23 @@ def _load_model(path: str):
         logger.exception("Failed to load checkpoint %s — skipping this model", name)
         return None
 
-@st.cache_resource(show_spinner="Loading models …")
-def load_all_models():
-    return {
-        "Synthetic":        _load_model(
-            os.path.join(MODELS_DIR, "star_finder_synthetic.pt")),
-        "Transfer-learned": _load_model(
-            os.path.join(MODELS_DIR, "star_finder_tl.pt")),
-        "Scratch (real)":   _load_model(
-            os.path.join(MODELS_DIR, "star_finder_scratch.pt")),
-    }
+CHECKPOINTS = {
+    "Synthetic":        os.path.join(MODELS_DIR, "star_finder_synthetic.pt"),
+    "Transfer-learned": os.path.join(MODELS_DIR, "star_finder_tl.pt"),
+    "Scratch (real)":   os.path.join(MODELS_DIR, "star_finder_scratch.pt"),
+}
 
-models    = load_all_models()
-available = {k: v for k, v in models.items() if v is not None}
+# Each checkpoint is a base_filters=64 U-Net (~124MB / 31M params). Eagerly
+# loading all 3 into memory at startup was OOM-killing the container on
+# Render's 512MB starter instance mid-boot. availability is now just a cheap
+# path-existence check; actual weights load lazily — and only for whichever
+# model(s) the user picks in the sidebar below — via load_one_model(), which
+# is itself cache_resource'd so re-selecting a model doesn't reload it.
+available_names = [name for name, path in CHECKPOINTS.items() if os.path.exists(path)]
+
+@st.cache_resource(show_spinner="Loading model …")
+def load_one_model(name: str):
+    return _load_model(CHECKPOINTS[name])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -226,7 +230,7 @@ def predict_and_figure(image_2d: np.ndarray,
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("StarNet")
 
-if not available:
+if not available_names:
     st.sidebar.error(
         "No trained model found in `models/`.  \n"
         "Run `python codes/train.py` first."
@@ -235,10 +239,21 @@ if not available:
 
 selected_names = st.sidebar.multiselect(
     "Models to compare",
-    options=list(available.keys()),
-    default=[list(available.keys())[0]],
+    options=available_names,
+    default=[available_names[0]],
 )
-selected_models = {k: available[k] for k in selected_names if k in available}
+
+# Loaded lazily here, one at a time, only for what's selected — see
+# load_one_model() above. A checkpoint that exists on disk but fails to
+# load (e.g. corrupted file) is skipped with an inline warning instead of
+# crashing the app.
+selected_models = {}
+for _name in selected_names:
+    _mdl = load_one_model(_name)
+    if _mdl is not None:
+        selected_models[_name] = _mdl
+    else:
+        st.sidebar.warning(f"Could not load '{_name}' — skipping.")
 
 threshold = st.sidebar.slider(
     "Detection threshold",
