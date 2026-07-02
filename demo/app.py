@@ -6,7 +6,7 @@ Launch:
     streamlit run demo/app.py
 """
 
-import os, sys, random as _rng
+import os, sys, logging, random as _rng
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -17,6 +17,11 @@ sys.path.insert(0, ROOT)
 
 import streamlit as st
 import torch
+
+# Server-side startup/model-load logging, visible in Render's log viewer
+# (separate from anything shown in the UI).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("starnet")
 
 # ── Starfield background ──────────────────────────────────────────────────────
 def _inject_starfield() -> None:
@@ -81,6 +86,28 @@ section[data-testid="stSidebar"] > div:first-child {{
 """, unsafe_allow_html=True)
 
 
+# ── Hide Community-Cloud-era chrome ────────────────────────────────────────────
+def _hide_streamlit_chrome() -> None:
+    """Hide the default toolbar/menu/footer — there's no "app owner" view on
+    Render, so the Fork/Deploy/GitHub toolbar Community Cloud showed is dead
+    weight here.
+
+    NOTE: `header {visibility: hidden;}` is deliberately NOT included. In some
+    Streamlit versions the header also carries the sidebar's collapse/expand
+    toggle, and this app's model picker + threshold slider live in
+    st.sidebar — hiding the header could trap users with no way to reopen a
+    collapsed sidebar. Flagging this rather than deciding it silently; add it
+    only after confirming the toggle isn't affected.
+    """
+    st.markdown("""
+        <style>
+        [data-testid="stToolbar"] {visibility: hidden; height: 0; position: fixed;}
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        </style>
+    """, unsafe_allow_html=True)
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="StarNet",
@@ -88,6 +115,7 @@ st.set_page_config(
     layout="wide",
 )
 _inject_starfield()
+_hide_streamlit_chrome()
 
 from codes.dataset       import generate_synthetic_field
 from codes.model import UNetStarFinder
@@ -99,12 +127,25 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 MODELS_DIR = os.path.join(ROOT, "models")
 
 def _load_model(path: str):
+    name = os.path.basename(path)
     if not os.path.exists(path):
+        logger.warning("Checkpoint not found: %s", path)
         return None
-    m = UNetStarFinder(base_filters=64, dropout=0.2).to(device)
-    m.load_state_dict(torch.load(path, map_location=device))
-    m.eval()
-    return m
+    try:
+        m = UNetStarFinder(base_filters=64, dropout=0.2).to(device)
+        m.load_state_dict(torch.load(path, map_location=device))
+        m.eval()
+        size_mb = os.path.getsize(path) / 1e6
+        logger.info("Loaded checkpoint %s (%.1f MB) on device=%s", name, size_mb, device)
+        return m
+    except Exception:
+        # A Docker build with unresolved Git LFS pointers is caught at build
+        # time (see Dockerfile), but this catches the same failure mode if it
+        # ever slips through — a corrupt/pointer-stub file otherwise crashes
+        # torch.load() and takes the whole app down instead of just disabling
+        # this one model.
+        logger.exception("Failed to load checkpoint %s — skipping this model", name)
+        return None
 
 @st.cache_resource(show_spinner="Loading models …")
 def load_all_models():

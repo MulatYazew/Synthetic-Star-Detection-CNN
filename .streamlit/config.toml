@@ -1,0 +1,26 @@
+# Config for running behind Render's HTTPS reverse proxy (previously
+# Streamlit Community Cloud handled all of this automatically).
+#
+# - headless = true            No local browser to auto-open inside a container.
+# - enableCORS = false         Render terminates TLS and proxies requests to this
+#                               container; the Origin header the proxy forwards
+#                               doesn't match what Streamlit's own CORS check
+#                               expects, so leaving CORS on blocks legitimate
+#                               requests to the app.
+# - enableXsrfProtection = false  Streamlit's XSRF check also compares proxied
+#                               Origin/Host headers and rejects widget actions
+#                               (e.g. file uploads) behind Render's proxy for
+#                               the same reason. Safe to disable here because
+#                               Render's reverse proxy + TLS termination is the
+#                               trust boundary, not Streamlit's own server.
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[client]
+toolbarMode = "viewer"
+showErrorDetails = false
+
+[browser]
+gatherUsageStats = false
