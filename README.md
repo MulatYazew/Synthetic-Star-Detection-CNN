@@ -198,20 +198,6 @@ The encoder already captures Gaussian-blob edge and gradient features that trans
 
 ---
 
-## Deploying to Render
-
-The demo is deployed as a Docker-based Render Web Service (`Dockerfile`, `render.yaml`, `.dockerignore`, `.streamlit/config.toml` at the repo root).
-
-1. **Connect the repo** — in the Render dashboard, New → Blueprint (or Web Service), and point it at this GitHub repo.
-2. **Render auto-detects `render.yaml`** and provisions a `env: docker` web service named `starnet-demo` using the root `Dockerfile`, `plan: starter`, and health check `/_stcore/health`.
-3. **Verify Git LFS resolved correctly.** `models/*.pt` (the 3 trained checkpoints) are committed via Git LFS. The Dockerfile fails the build with an explicit error if these come through as LFS pointer stubs instead of real weights — if the first build fails on that check, enable Git LFS for the service under Settings → Build & Deploy and redeploy.
-4. **Environment variables / secrets** — none are currently required. This app has no `.streamlit/secrets.toml` and no `st.secrets[...]` calls, so there's nothing to configure in Render's dashboard today. If you add API keys or other config later, set them under the service's Environment tab (`render.yaml`'s `envVars` has a placeholder comment for this).
-5. **Deploy.** Render builds the Docker image and starts the container with `streamlit run demo/app.py --server.port=$PORT --server.address=0.0.0.0`.
-
-**Cold starts on the free plan:** `render.yaml` defaults to `plan: starter` to avoid this, but if you switch to `plan: free`, the instance sleeps after ~15 minutes of inactivity and the next request pays a 30–60s cold start while it wakes back up. Fine for infrequent demo use, not ideal if you want it to always respond instantly.
-
----
-
 ## Performance (Apple Silicon / MPS)
 
 | Metric | CPU | MPS (default) |

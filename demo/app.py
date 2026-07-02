@@ -18,8 +18,8 @@ sys.path.insert(0, ROOT)
 import streamlit as st
 import torch
 
-# Server-side startup/model-load logging, visible in Render's log viewer
-# (separate from anything shown in the UI).
+# Server-side startup/model-load logging, visible in the hosting platform's
+# log viewer (separate from anything shown in the UI).
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("starnet")
 
@@ -86,11 +86,11 @@ section[data-testid="stSidebar"] > div:first-child {{
 """, unsafe_allow_html=True)
 
 
-# ── Hide Community-Cloud-era chrome ────────────────────────────────────────────
+# ── Hide default Streamlit chrome ──────────────────────────────────────────────
 def _hide_streamlit_chrome() -> None:
-    """Hide the default toolbar/menu/footer — there's no "app owner" view on
-    Render, so the Fork/Deploy/GitHub toolbar Community Cloud showed is dead
-    weight here.
+    """Hide the default toolbar/menu/footer for a cleaner public-facing demo —
+    visitors don't need Community Cloud's Fork/Deploy/GitHub toolbar, the
+    hamburger menu, or the "Made with Streamlit" footer.
 
     NOTE: `header {visibility: hidden;}` is deliberately NOT included. In some
     Streamlit versions the header also carries the sidebar's collapse/expand
@@ -139,11 +139,11 @@ def _load_model(path: str):
         logger.info("Loaded checkpoint %s (%.1f MB) on device=%s", name, size_mb, device)
         return m
     except Exception:
-        # A Docker build with unresolved Git LFS pointers is caught at build
-        # time (see Dockerfile), but this catches the same failure mode if it
-        # ever slips through — a corrupt/pointer-stub file otherwise crashes
-        # torch.load() and takes the whole app down instead of just disabling
-        # this one model.
+        # models/*.pt are Git-LFS tracked (see .gitattributes) — Community
+        # Cloud's LFS support has been unreliable historically, so a failed
+        # clone can leave a small pointer-stub file in place of real weights.
+        # Catching this here means one bad/missing checkpoint just disables
+        # that model instead of crashing the whole app.
         logger.exception("Failed to load checkpoint %s — skipping this model", name)
         return None
 
@@ -154,8 +154,8 @@ CHECKPOINTS = {
 }
 
 # Each checkpoint is a base_filters=64 U-Net (~124MB / 31M params). Eagerly
-# loading all 3 into memory at startup was OOM-killing the container on
-# Render's 512MB starter instance mid-boot. availability is now just a cheap
+# loading all 3 into memory at startup previously OOM-killed the app on a
+# memory-constrained instance mid-boot. availability is now just a cheap
 # path-existence check; actual weights load lazily — and only for whichever
 # model(s) the user picks in the sidebar below — via load_one_model(), which
 # is itself cache_resource'd so re-selecting a model doesn't reload it.
