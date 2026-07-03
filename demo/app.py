@@ -18,6 +18,35 @@ sys.path.insert(0, ROOT)
 import streamlit as st
 import torch
 
+# ── Embed-mode enforcement (must run before any other st.* call) ──────────────
+def _enforce_embed_view() -> None:
+    """Community Cloud only hides its toolbar (Share/star/fork/GitHub icon),
+    footer, and top color bar when the URL carries ?embed=true. Redirect
+    anyone who opens the bare public URL into that view automatically, so
+    the clean link is safe to hand out without visitors needing to
+    remember the query param.
+
+    ?admin=<ADMIN_TOKEN> bypasses the redirect and shows full chrome for
+    management — set ADMIN_TOKEN in .streamlit/secrets.toml locally, or in
+    Community Cloud's app Secrets dashboard for the deployed app (see
+    .streamlit/secrets.toml.example).
+
+    An unset/empty ADMIN_TOKEN never grants a bypass, even if a visitor
+    appends `?admin=` with no value — otherwise "" == "" would make the
+    admin check trivially satisfiable before a real token is configured.
+    """
+    params = st.query_params
+    admin_token = st.secrets.get("ADMIN_TOKEN", "")
+    is_admin = bool(admin_token) and params.get("admin") == admin_token
+    if "embed" not in params and not is_admin:
+        st.markdown(
+            "<meta http-equiv='refresh' content='0; url=?embed=true'>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+_enforce_embed_view()
+
 # Server-side startup/model-load logging, visible in the hosting platform's
 # log viewer (separate from anything shown in the UI).
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -108,6 +137,24 @@ def _hide_streamlit_chrome() -> None:
     """, unsafe_allow_html=True)
 
 
+# ── Restore padding lost to ?embed=true ─────────────────────────────────────
+def _restore_embed_padding() -> None:
+    """?embed=true (auto-appended by _enforce_embed_view) strips Streamlit's
+    default top/bottom page padding. Restore it here directly instead of
+    asking visitors to also append &embed_options=show_padding — that would
+    defeat the point of handing out a clean, parameter-free public link.
+    """
+    if st.query_params.get("embed") == "true":
+        st.markdown("""
+            <style>
+            [data-testid="stMainBlockContainer"] {
+                padding-top: 3rem;
+                padding-bottom: 3rem;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="StarNet",
@@ -116,6 +163,7 @@ st.set_page_config(
 )
 _inject_starfield()
 _hide_streamlit_chrome()
+_restore_embed_padding()
 
 from codes.dataset       import generate_synthetic_field
 from codes.model import UNetStarFinder

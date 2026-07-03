@@ -226,6 +226,19 @@ Features:
 - **Upload tab** — run star detection on your own PNG / TIFF / NPY / FITS (`.fits.fz`) image
 - **Live IoU and star count** — side-by-side comparison with adjustable detection threshold
 
+### Links
+
+- **Admin (me):** `https://<app>.streamlit.app/?admin=<token>`
+- **Public (share this one):** `https://<app>.streamlit.app/`
+
+The public bare link now self-redirects into Community Cloud's `?embed=true`
+view, which hides the platform toolbar (Share/star/fork/GitHub icon), footer,
+and top color bar — so it's safe to hand out as-is, with nothing to append
+manually. The admin link bypasses that redirect and shows full chrome, for
+managing the app. Set `ADMIN_TOKEN` in Community Cloud's app → Settings →
+Secrets dashboard (see `.streamlit/secrets.toml.example` for the local
+template) before relying on the admin link in production.
+
 ---
 
 ## Data
