@@ -34,13 +34,24 @@ def _enforce_embed_view() -> None:
     An unset/empty ADMIN_TOKEN never grants a bypass, even if a visitor
     appends `?admin=` with no value — otherwise "" == "" would make the
     admin check trivially satisfiable before a real token is configured.
+
+    NOTE: `embed`/`embed_options` are reserved query params that Streamlit's
+    frontend intercepts for its own use — they never reach st.query_params
+    server-side (see EMBED_QUERY_PARAMS_KEYS filtering in
+    streamlit/runtime/state/query_params.py). Checking `"embed" not in
+    params` here would therefore be True forever, even right after landing
+    on ?embed=true, causing an infinite redirect loop (symptom: the page
+    flickers/reloads nonstop). We instead tag the redirect with a second,
+    non-reserved marker param ("embedded") that Streamlit *does* forward to
+    the script, and check that instead — it round-trips normally so the
+    redirect only fires once.
     """
     params = st.query_params
     admin_token = st.secrets.get("ADMIN_TOKEN", "")
     is_admin = bool(admin_token) and params.get("admin") == admin_token
-    if "embed" not in params and not is_admin:
+    if "embedded" not in params and not is_admin:
         st.markdown(
-            "<meta http-equiv='refresh' content='0; url=?embed=true'>",
+            "<meta http-equiv='refresh' content='0; url=?embed=true&embedded=true'>",
             unsafe_allow_html=True,
         )
         st.stop()
@@ -143,8 +154,14 @@ def _restore_embed_padding() -> None:
     default top/bottom page padding. Restore it here directly instead of
     asking visitors to also append &embed_options=show_padding — that would
     defeat the point of handing out a clean, parameter-free public link.
+
+    Checks the "embedded" marker rather than "embed" itself: "embed" is a
+    reserved query param Streamlit filters out of st.query_params (see the
+    note in _enforce_embed_view), so it would never be visible here either.
+    _enforce_embed_view always pairs embed=true with embedded=true, so this
+    stays in sync with actual embed mode.
     """
-    if st.query_params.get("embed") == "true":
+    if st.query_params.get("embedded") == "true":
         st.markdown("""
             <style>
             [data-testid="stMainBlockContainer"] {
