@@ -56,8 +56,6 @@ def _enforce_embed_view() -> None:
         )
         st.stop()
 
-_enforce_embed_view()
-
 # Server-side startup/model-load logging, visible in the hosting platform's
 # log viewer (separate from anything shown in the UI).
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -173,6 +171,13 @@ def _restore_embed_padding() -> None:
 
 
 # ── Page config ──────────────────────────────────────────────────────────────
+# Must run before _enforce_embed_view(): that function may st.stop() the
+# script on this very run (bare-URL visitors, before the embed redirect
+# lands), and if the dark theme + hidden chrome aren't queued yet, that
+# transient render shows default light Streamlit chrome — a visible flash
+# right before the redirect swaps in the real (dark, chrome-hidden) page.
+# Rendering them first makes the two renders look identical, so the
+# still-necessary redirect is no longer visible as a "blink".
 st.set_page_config(
     page_title="StarNet",
     page_icon="⭐",
@@ -180,6 +185,9 @@ st.set_page_config(
 )
 _inject_starfield()
 _hide_streamlit_chrome()
+
+_enforce_embed_view()
+
 _restore_embed_padding()
 
 from codes.dataset       import generate_synthetic_field
