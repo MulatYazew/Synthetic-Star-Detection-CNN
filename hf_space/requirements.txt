@@ -1,0 +1,10 @@
+streamlit
+torch
+numpy
+scipy
+scikit-image
+matplotlib
+astropy
+Pillow
+tqdm
+huggingface_hub
