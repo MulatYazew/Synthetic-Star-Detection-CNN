@@ -20,6 +20,7 @@ Launch locally:
 
 import os
 import logging
+import random as _rng
 
 import numpy as np
 import matplotlib
@@ -37,7 +38,77 @@ from codes.evaluate import count_stars, pixel_iou
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("starnet")
 
+
+# ── Starfield background ─────────────────────────────────────────────────────
+def _inject_starfield() -> None:
+    """Dark night-sky background with twinkling stars, rendered behind the
+    app via CSS box-shadow (hundreds of radial dots in one element, cheaper
+    than one DOM node per star). The background must stay dark (#0e1117) —
+    the stars are drawn in white, so a light background would hide them.
+    """
+    r = _rng.Random(42)
+
+    def _shadows(n: int, color: str = "#fff") -> str:
+        return ", ".join(
+            f"{r.randint(0, 2560)}px {r.randint(0, 1440)}px {color}"
+            for _ in range(n)
+        )
+
+    small  = _shadows(700)
+    medium = _shadows(250)
+    large  = _shadows(80)
+
+    st.markdown(f"""
+<style>
+html, body {{
+    background: #0e1117 !important;
+    margin: 0; padding: 0;
+}}
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMainBlockContainer"],
+[data-testid="stMain"] {{
+    background: transparent !important;
+}}
+section[data-testid="stSidebar"] > div:first-child {{
+    background: rgba(14, 17, 23, 0.82) !important;
+    backdrop-filter: blur(6px);
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+}}
+.sf-nebula {{
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: -998;
+    pointer-events: none;
+    background:
+        radial-gradient(ellipse 60% 40% at 18% 28%, rgba(35, 20, 70, 0.55) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 55% at 78% 58%, rgba(10, 30, 60, 0.45) 0%, transparent 70%),
+        radial-gradient(ellipse 70% 30% at 50% 88%, rgba(25, 10, 45, 0.35) 0%, transparent 70%);
+}}
+.sf-star {{
+    position: fixed;
+    top: 0; left: 0;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: -999;
+}}
+#sf-s {{ width:1px; height:1px; box-shadow:{small};  animation:sf-tw1 3.5s ease-in-out infinite alternate; }}
+#sf-m {{ width:2px; height:2px; box-shadow:{medium}; animation:sf-tw2 5.5s ease-in-out infinite alternate; }}
+#sf-l {{ width:3px; height:3px; box-shadow:{large};  animation:sf-tw3 7.5s ease-in-out infinite alternate; }}
+@keyframes sf-tw1 {{ from{{opacity:.12}} to{{opacity:1.00}} }}
+@keyframes sf-tw2 {{ from{{opacity:.30}} to{{opacity:.90}} }}
+@keyframes sf-tw3 {{ from{{opacity:.08}} to{{opacity:.85}} }}
+</style>
+<div class="sf-nebula"></div>
+<div id="sf-s" class="sf-star"></div>
+<div id="sf-m" class="sf-star"></div>
+<div id="sf-l" class="sf-star"></div>
+""", unsafe_allow_html=True)
+
+
 st.set_page_config(page_title="StarNet", page_icon="⭐", layout="wide")
+_inject_starfield()
 
 device = torch.device(
     "cuda" if torch.cuda.is_available()
